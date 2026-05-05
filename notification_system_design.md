@@ -804,3 +804,131 @@ WHERE  user_id = $1
 | Mark-all-read locking | Batched UPDATE in chunks of 500 |
 | Table bloat over time | Monthly partitioning + scheduled DELETE of old rows |
 | Connection overload | PgBouncer connection pooling |
+
+# Stage 3
+ 
+## Query Analysis, Optimization & Indexing
+ 
+---
+ 
+## Is the Original Query Accurate?
+ 
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+ 
+**Functionally — yes.** The query returns the correct result: all unread notifications for student 1042, ordered oldest-first.
+ 
+**However, it has two practical problems:**
+ 
+**1. `SELECT *` is wasteful.** The frontend only needs `id`, `title`, `message`, `notificationType`, `createdAt`. Fetching every column wastes network bandwidth and serialization time — especially critical when millions of rows exist.
+ 
+**2. `ORDER BY createdAt ASC` is debatable.** For a notification inbox, most UIs show newest-first (`DESC`). Oldest-first is unusual and likely unintended — a new notification buried at the bottom is a poor user experience.
+ 
+---
+ 
+## Why Is It Slow?
+ 
+With 50,000 students and 5,000,000 notifications (~100 notifications/student on average), this query is slow for two compounding reasons:
+ 
+### Reason 1 — Full Table Scan (No Index)
+ 
+Without an index on `studentID`, PostgreSQL/MySQL performs a **sequential scan** — reading all 5,000,000 rows to find the ones where `studentID = 1042`. This is O(N) where N = 5,000,000.
+ 
+### Reason 2 — No Composite Index for the Full WHERE Clause
+ 
+Even with a single index on `studentID`, the database then must re-filter those results for `isRead = false` in memory, and then sort them by `createdAt`. Without a composite index covering all three columns, each of these steps is additional in-memory work on a potentially large intermediate result set.
+ 
+### Computation Cost (Before Optimization)
+ 
+| Step | Operation | Cost |
+|------|-----------|------|
+| Filter by studentID | Sequential scan, 5M rows | O(N) — very slow |
+| Filter isRead = false | In-memory filter on result | O(k) where k = student's notifications |
+| ORDER BY createdAt | In-memory sort | O(k log k) |
+| **Total** | | **O(N) dominant — unacceptable at scale** |
+ 
+---
+ 
+## The Fix — Composite Index
+ 
+```sql
+CREATE INDEX idx_notifications_student_unread_date
+  ON notifications (studentID, isRead, createdAt DESC);
+```
+ 
+This single composite index covers all three clauses of the query — the database jumps directly to `studentID = 1042`, filters `isRead = false` within that partition, and the results are already sorted by `createdAt`. No table scan, no in-memory sort.
+ 
+### Optimized Query
+ 
+```sql
+SELECT id, title, message, notificationType, createdAt
+FROM   notifications
+WHERE  studentID = 1042
+  AND  isRead    = false
+ORDER BY createdAt DESC;
+```
+ 
+Changes made:
+- `SELECT *` → explicit columns only
+- `ORDER BY createdAt ASC` → `DESC` (newest-first for inbox UX)
+- Composite index ensures the WHERE + ORDER BY is fully index-backed
+### Computation Cost (After Optimization)
+ 
+| Step | Operation | Cost |
+|------|-----------|------|
+| Locate studentID in index | B-tree lookup | O(log N) |
+| Filter isRead = false | Index scan within student's rows | O(k) |
+| ORDER BY createdAt | Already sorted in index | O(1) |
+| **Total** | | **O(log N + k) — fast at any scale** |
+ 
+At 5,000,000 rows, `log₂(5,000,000) ≈ 22` comparisons to locate the student's data. This is effectively instant.
+ 
+---
+ 
+## Should You Index Every Column?
+ 
+**No. This advice is actively harmful.**
+ 
+A teammate suggesting "index every column to be safe" is a common misconception. Here is why it is wrong:
+ 
+**Every index has a write cost.** On every `INSERT`, `UPDATE`, or `DELETE`, PostgreSQL must update every index that covers the modified columns. With 10 indexes on the `notifications` table, inserting one notification updates 10 data structures instead of 1. At 50,000 students receiving bulk notifications, this write amplification severely slows down inserts.
+ 
+**Indexes consume significant storage.** Each index is a separate B-tree data structure on disk. Indexing every column of a 5M-row table could easily consume several gigabytes of extra storage — much of it never queried.
+ 
+**The query planner can be confused.** With many indexes, PostgreSQL's query planner has more paths to evaluate and can occasionally pick a suboptimal one.
+ 
+**Low-cardinality columns waste index space.** Indexing a boolean column like `isRead` alone (only 2 values) gives the planner almost no selectivity — it would still scan ~50% of the table. Boolean columns are only useful inside composite indexes.
+ 
+**The right approach:** Index based on actual query patterns. One well-designed composite index covering `(studentID, isRead, createdAt)` is worth more than ten single-column indexes.
+ 
+---
+ 
+## Query — Students Who Got a Placement Notification in the Last 7 Days
+ 
+```sql
+SELECT DISTINCT s.id, s.name, s.email
+FROM   students      s
+JOIN   notifications n ON n.studentID = s.id
+WHERE  n.notificationType = 'Placement'
+  AND  n.createdAt >= NOW() - INTERVAL '7 days';
+```
+ 
+**Why `DISTINCT`?** A student may have received multiple placement notifications in 7 days. `DISTINCT` ensures each student appears only once in the result.
+ 
+**Why `JOIN` instead of a subquery?** A JOIN with DISTINCT is typically more efficient than `WHERE studentID IN (SELECT ...)` for large datasets because the planner can use hash joins and avoid re-scanning the subquery result.
+ 
+**Supporting index for this query:**
+ 
+```sql
+CREATE INDEX idx_notifications_type_created
+  ON notifications (notificationType, createdAt DESC);
+```
+ 
+This allows the database to jump directly to all `Placement` rows within the last 7 days without scanning unrelated notification types.
+ 
+---
+ 
+---
