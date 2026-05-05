@@ -1,5 +1,6 @@
 import React from "react";
 import { Card, CardContent, Typography, Box, Chip, Avatar } from "@mui/material";
+import { useTheme, alpha } from "@mui/material/styles";
 import EventIcon from "@mui/icons-material/Event";
 import AssignmentTurnedInIcon from "@mui/icons-material/AssignmentTurnedIn";
 import WorkIcon from "@mui/icons-material/Work";
@@ -43,22 +44,35 @@ export default function NotificationCard({ notification }) {
 
   const formattedDate = Timestamp ? formatDistanceToNow(new Date(Timestamp), { addSuffix: true }) : "";
 
+  const theme = useTheme();
+
+  const cardSx = {
+    mb: 2,
+    // Always show a teal highlight on the left for visual consistency
+    borderLeft: `4px solid ${theme.palette.primary.main}`,
+    // Use theme surface for card background so it respects dark/light mode.
+    bgcolor: theme.palette.background.paper,
+    transition: "transform 0.2s",
+    "&:hover": {
+      transform: "translateY(-2px)",
+      boxShadow: 2,
+    },
+  };
+
   return (
-    <Card 
-      sx={{ 
-        mb: 2, 
-        borderLeft: isRead ? "none" : "4px solid #1976d2",
-        bgcolor: isRead ? "background.paper" : "#f8fbff",
-        transition: "transform 0.2s",
-        "&:hover": {
-          transform: "translateY(-2px)",
-          boxShadow: 2
-        }
-      }}
-    >
+    <Card sx={cardSx}>
       <CardContent>
         <Box sx={{ display: "flex", alignItems: "flex-start", gap: 2 }}>
-          <Avatar sx={{ bgcolor: getTypeColor(Type) + ".light", color: getTypeColor(Type) + ".main" }}>
+          <Avatar
+            sx={(t) => ({
+              bgcolor:
+                (t.palette[getTypeColor(Type)] && t.palette[getTypeColor(Type)].light) ||
+                alpha(t.palette.primary.main, 0.12),
+              color:
+                (t.palette[getTypeColor(Type)] && t.palette[getTypeColor(Type)].main) ||
+                t.palette.primary.main,
+            })}
+          >
             {getTypeIcon(Type)}
           </Avatar>
           <Box sx={{ flexGrow: 1 }}>
@@ -74,12 +88,53 @@ export default function NotificationCard({ notification }) {
               {Message}
             </Typography>
             <Box sx={{ display: "flex", gap: 1 }}>
-              <Chip label={Type} size="small" color={getTypeColor(Type)} variant="outlined" />
+              {/** Type chip with outlined/soft surface using palette */}
+              {
+                (() => {
+                  const key = getTypeColor(Type);
+                  const pal = theme.palette[key] || theme.palette.primary;
+                  return (
+                    <Chip
+                      label={Type}
+                      size="small"
+                      variant="outlined"
+                      sx={{
+                        borderColor: alpha(pal.main, 0.22),
+                        color: pal.main,
+                        backgroundColor: alpha(pal.main, 0.02),
+                      }}
+                    />
+                  );
+                })()
+              }
+
               {Priority && Priority !== "low" && (
-                <Chip label={Priority} size="small" color={getPriorityColor(Priority)} />
+                (() => {
+                  const key = getPriorityColor(Priority);
+                  const pal = theme.palette[key] || theme.palette.warning || theme.palette.primary;
+                  const textCol = pal.contrastText || (theme.palette.mode === 'dark' ? '#061418' : '#fff');
+                  return (
+                    <Chip
+                      label={Priority}
+                      size="small"
+                      sx={{
+                        backgroundColor: pal.main,
+                        color: textCol,
+                      }}
+                    />
+                  );
+                })()
               )}
-              {!isRead && (
-                <Chip label="New" size="small" color="primary" />
+
+              {(!isRead) && (
+                <Chip
+                  label="New"
+                  size="small"
+                  sx={{
+                    backgroundColor: theme.palette.primary.main,
+                    color: theme.palette.primary.contrastText || '#021217',
+                  }}
+                />
               )}
             </Box>
           </Box>
