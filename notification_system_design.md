@@ -1070,3 +1070,207 @@ For this system at current scale:
 ---
  
 ---
+
+# Stage 5
+
+## Bulk Notification — Reliability & Redesign
+
+---
+
+## Problems with the Original Implementation
+
+```python
+function notify_all(student_ids: array, message: string):
+  for student_id in student_ids:
+    send_email(student_id, message)     # calls Email API
+    save_to_db(student_id, message)     # DB insert
+    push_to_app(student_id, message)
+```
+
+### Problem 1 — Synchronous Sequential Loop
+
+Processing 50,000 students one by one in a `for` loop is extremely slow. If each iteration takes 200ms (email API + DB insert + push), total time = 50,000 × 200ms = **2.7 hours**. The HR clicks "Notify All" and waits nearly 3 hours for it to complete.
+
+### Problem 2 — No Failure Handling or Retry
+
+If `send_email` fails for student 5,000, the loop crashes or skips silently. There is no retry mechanism. The 200 failed students are lost — no record of the failure, no way to retry just those students.
+
+### Problem 3 — Single Point of Failure
+
+If the server restarts mid-loop (at student 25,000), there is no checkpoint. The entire operation must be restarted from scratch, causing duplicate notifications for the first 25,000 students.
+
+### Problem 4 — DB and Email API Overwhelmed Simultaneously
+
+Firing 50,000 DB inserts and 50,000 email API calls at maximum speed hammers both services. The DB connection pool is exhausted, email API rate limits are hit, and everything slows or fails.
+
+### Problem 5 — Tight Coupling of Unrelated Operations
+
+Saving to DB (fast, reliable) and sending email (slow, unreliable, dependent on external API) are coupled inside the same loop iteration. A slow email API blocks the DB insert for every subsequent student.
+
+---
+
+## The 200 Failed Emails — What Now?
+
+With the original implementation, these 200 failures are unrecoverable — there is no log of which students failed, and no retry path.
+
+The fix requires: at the time of failure, log the failed `student_id` to a **dead-letter queue (DLQ)**. A separate retry worker reads from the DLQ and re-attempts delivery with exponential backoff (retry after 1s, 2s, 4s, 8s... up to 5 attempts). After 5 failures, flag the record in the DB as `delivery_status = 'failed'` for manual review.
+
+---
+
+## Should DB Save and Email Send Happen Together?
+
+**No — they should be decoupled.**
+
+Saving to the DB is a fast, local, reliable operation. Sending an email is slow, depends on an external API, and can fail for reasons entirely outside our control (API rate limit, network timeout, provider outage).
+
+Coupling them means: if the email API is slow, the DB insert waits. If the email API is down, the notification is never saved to DB at all — the student never sees it in their inbox either.
+
+**The correct model:** Save to DB first (immediately, reliably). Then enqueue the email send as a separate async job. The in-app notification reflects instantly. The email arrives shortly after. These are independent delivery channels and should fail or succeed independently.
+
+---
+
+## Redesigned Implementation
+
+### Architecture
+
+```
+HR clicks "Notify All"
+         │
+         ▼
+  API Handler (fast response to HR — "Job queued ✓")
+         │
+         ▼
+  Batch Job Producer
+  → splits 50,000 IDs into chunks of 500
+  → pushes each chunk as a job onto Message Queue (e.g. Redis/BullMQ)
+         │
+         ▼
+  ┌──────────────────────────────────────┐
+  │   Worker Pool (e.g. 10 workers)      │
+  │   Each worker picks one chunk (500)  │
+  │   and processes in parallel          │
+  └──────────────────────────────────────┘
+         │
+         ▼
+  For each student in chunk:
+    ├─ save_to_db()       → bulk INSERT (500 rows at once)
+    ├─ push_to_app()      → in-app notification
+    └─ enqueue_email()    → separate email queue (decoupled)
+         │
+         ▼
+  Email Worker (separate)
+    → reads from email queue
+    → calls send_email() with retry + backoff
+    → on failure → dead-letter queue
+```
+
+---
+
+### Revised Pseudocode
+
+```javascript
+// ─── PRODUCER (called when HR clicks "Notify All") ───────────────────────
+
+async function notify_all(student_ids, message) {
+  Log("backend", "info", "handler", `notify_all triggered for ${student_ids.length} students`);
+
+  const CHUNK_SIZE = 500;
+  const chunks = [];
+
+  // Split into chunks of 500
+  for (let i = 0; i < student_ids.length; i += CHUNK_SIZE) {
+    chunks.push(student_ids.slice(i, i + CHUNK_SIZE));
+  }
+
+  // Push each chunk as a job onto the notification queue
+  for (const chunk of chunks) {
+    await notificationQueue.add("bulk_notify", { student_ids: chunk, message });
+  }
+
+  Log("backend", "info", "service", `${chunks.length} chunks enqueued for bulk notification`);
+  return { success: true, message: "Notification job queued", totalStudents: student_ids.length };
+}
+
+
+// ─── NOTIFICATION WORKER (runs in parallel, one chunk per job) ───────────
+
+notificationQueue.process("bulk_notify", 10, async (job) => {
+  const { student_ids, message } = job.data;
+
+  Log("backend", "info", "service", `Processing notification chunk of ${student_ids.length} students`);
+
+  try {
+    // 1. Bulk DB insert (one query for 500 students — not 500 queries)
+    await bulk_save_to_db(student_ids, message);
+    Log("backend", "info", "db", `Bulk DB insert complete for ${student_ids.length} students`);
+
+    // 2. Push in-app notifications
+    await push_to_app(student_ids, message);
+    Log("backend", "info", "service", `In-app push complete for ${student_ids.length} students`);
+
+    // 3. Enqueue emails separately — do NOT send inline
+    for (const student_id of student_ids) {
+      await emailQueue.add(
+        "send_email",
+        { student_id, message },
+        { attempts: 5, backoff: { type: "exponential", delay: 1000 } }
+      );
+    }
+
+    Log("backend", "info", "service", `Email jobs enqueued for ${student_ids.length} students`);
+
+  } catch (err) {
+    Log("backend", "error", "service", `Chunk processing failed: ${err.message}`);
+    throw err; // triggers BullMQ retry for the whole chunk
+  }
+});
+
+
+// ─── EMAIL WORKER (separate, processes one student at a time) ────────────
+
+emailQueue.process("send_email", 20, async (job) => {
+  const { student_id, message } = job.data;
+
+  try {
+    await send_email(student_id, message);
+    Log("backend", "info", "service", `Email sent successfully to student ${student_id}`);
+
+  } catch (err) {
+    Log("backend", "error", "service", `Email failed for student ${student_id}: ${err.message}`);
+
+    // BullMQ handles retry automatically (5 attempts, exponential backoff)
+    // After 5 failures → job moves to dead-letter queue automatically
+    throw err;
+  }
+});
+
+
+// ─── DEAD LETTER QUEUE MONITOR ───────────────────────────────────────────
+
+emailQueue.on("failed", async (job, err) => {
+  if (job.attemptsMade >= 5) {
+    const { student_id } = job.data;
+    Log("backend", "fatal", "service", `Email permanently failed for student ${student_id} after 5 attempts`);
+
+    // Mark in DB for manual review / admin dashboard
+    await mark_delivery_failed_in_db(student_id);
+  }
+});
+```
+
+---
+
+### Key Improvements Over Original
+
+| Issue | Original | Redesigned |
+|-------|----------|------------|
+| Speed | Sequential, ~2.7 hours | Parallel workers, ~5–10 minutes |
+| Failure handling | Silent failure | Retry with exponential backoff |
+| Partial failure recovery | Restart from scratch | Only failed jobs retried |
+| DB + email coupling | Tightly coupled | Fully decoupled queues |
+| DB insert efficiency | 1 row per query | 500 rows per bulk INSERT |
+| Observability | None | Logged at every stage with logID |
+
+---
+
+---
