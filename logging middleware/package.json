@@ -1,0 +1,11 @@
+{
+  "name": "logging-middleware",
+  "version": "1.0.0",
+  "description": "Reusable logging middleware — sends logs to evaluation-service",
+  "main": "logger.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "keywords": ["logging", "middleware"],
+  "license": "ISC"
+}
