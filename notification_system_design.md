@@ -932,3 +932,141 @@ This allows the database to jump directly to all `Placement` rows within the las
 ---
  
 ---
+
+# Stage 4
+ 
+## Caching Strategy — Reducing DB Load on Page Load
+ 
+---
+ 
+## The Problem
+ 
+Every page load triggers a DB query for every student. At 50,000 concurrent students, that is 50,000 simultaneous `SELECT` queries against the same `notifications` table. The DB becomes the bottleneck — query queue backs up, response times spike, and the user experience degrades.
+ 
+---
+ 
+## Suggested Solutions
+ 
+---
+ 
+### Strategy 1 — Server-Side Caching with Redis
+ 
+**How it works:** On the first request for a student's notifications, fetch from the DB and store the result in Redis with a TTL (Time To Live) of 60 seconds. Subsequent requests within that window are served from Redis — the DB is never touched.
+ 
+```
+Request → Check Redis cache
+              ├─ HIT  → return cached notifications (< 1ms)
+              └─ MISS → query DB → store in Redis → return result
+```
+ 
+**Cache key design:**
+```
+notifications:student:{studentID}:page:{page}:type:{type}:status:{status}
+```
+ 
+**Invalidation:** When a notification is created, marked as read, or deleted for `studentID`, delete all Redis keys matching `notifications:student:{studentID}:*`. The next request repopulates the cache from DB.
+ 
+**Tradeoffs:**
+ 
+| Pro | Con |
+|-----|-----|
+| Dramatically reduces DB read load | Adds Redis as an infrastructure dependency |
+| Sub-millisecond cache hits | Cache invalidation logic must be maintained carefully |
+| Horizontally scalable | Stale data possible within TTL window (max 60s) |
+| Works for all students uniformly | Memory cost — large notification sets consume RAM |
+ 
+---
+ 
+### Strategy 2 — Unread Count Cache (Targeted Caching)
+ 
+Instead of caching the full notification list, cache only the **unread count** — the most-polled endpoint.
+ 
+```
+Redis key: unread_count:student:{studentID}  →  value: 7  →  TTL: 30s
+```
+ 
+This is lightweight (one integer per student) and directly addresses the highest-frequency query. The full notification list is only fetched when the user actually opens the inbox.
+ 
+**Tradeoffs:**
+ 
+| Pro | Con |
+|-----|-----|
+| Extremely low memory footprint | Only solves the count endpoint, not full list |
+| Simple invalidation (delete one key) | Full list fetch still hits DB |
+| Reduces polling load by ~80% | Still requires Redis infrastructure |
+ 
+---
+ 
+### Strategy 3 — Pagination & Lazy Loading
+ 
+**How it works:** Never load all notifications at once. Load 20 at a time. The user scrolls to trigger the next page.
+ 
+```
+GET /notifications?page=1&limit=20   →  20 rows from DB
+GET /notifications?page=2&limit=20   →  next 20 rows (only if user scrolls)
+```
+ 
+Most students never scroll past page 1. This alone reduces DB rows read per request from potentially thousands to exactly 20.
+ 
+**Tradeoffs:**
+ 
+| Pro | Con |
+|-----|-----|
+| Zero infrastructure cost — pure SQL | Does not reduce total DB connections |
+| Drastically reduces data transferred | Users must scroll to see older notifications |
+| Combines well with Redis caching | Requires offset-based or cursor-based pagination |
+ 
+**Cursor-based pagination** (preferred at scale over `OFFSET`):
+ 
+```sql
+-- First page
+SELECT id, title, message, createdAt FROM notifications
+WHERE studentID = $1 AND isRead = false
+ORDER BY createdAt DESC LIMIT 20;
+ 
+-- Next page (cursor = last createdAt from previous page)
+SELECT id, title, message, createdAt FROM notifications
+WHERE studentID = $1 AND isRead = false
+  AND createdAt < $2   -- cursor
+ORDER BY createdAt DESC LIMIT 20;
+```
+ 
+`OFFSET 1000` forces the DB to skip 1000 rows. Cursor-based pagination always starts from an index position — O(log N) regardless of page depth.
+ 
+---
+ 
+### Strategy 4 — HTTP Response Caching (ETag / Cache-Control)
+ 
+**How it works:** The server sends an `ETag` header (a hash of the response). On subsequent requests, the browser sends `If-None-Match: <etag>`. If nothing changed, the server returns `304 Not Modified` with no body — zero DB query, zero bandwidth.
+ 
+```
+Response headers:
+  ETag: "a3f8c2d1"
+  Cache-Control: private, max-age=30
+ 
+Next request:
+  If-None-Match: "a3f8c2d1"
+  → 304 Not Modified (no body, no DB hit)
+```
+ 
+**Tradeoffs:**
+ 
+| Pro | Con |
+|-----|-----|
+| Zero server processing on cache hit | DB still queried to compute ETag on first load |
+| No Redis needed | Requires ETag generation logic on server |
+| Works transparently with browsers | Not effective for highly dynamic data |
+ 
+---
+ 
+### Recommended Combined Strategy
+ 
+For this system at current scale:
+ 
+1. **Pagination (limit 20)** — implement immediately, zero cost, biggest impact
+2. **Redis cache on full notification list** with 60s TTL + invalidation on write
+3. **Redis cache on unread count** with 30s TTL for the polling endpoint
+4. **ETag headers** on the notification list endpoint as an additional layer
+---
+ 
+---
