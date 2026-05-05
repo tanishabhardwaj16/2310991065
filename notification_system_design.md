@@ -1274,3 +1274,44 @@ emailQueue.on("failed", async (job, err) => {
 ---
 
 ---
+
+
+# Stage 6
+
+## Priority Inbox — Top N Notifications by Weight + Recency
+
+---
+
+## Approach
+
+Each notification is scored using a **weighted formula** that combines notification type importance and recency:
+
+```
+score = type_weight × recency_factor
+
+type_weight:
+  Placement → 3
+  Result    → 2
+  Event     → 1
+
+recency_factor = 1 / (1 + hours_since_created)
+```
+
+This means a Placement notification from 1 hour ago scores higher than a Result from 1 hour ago, which scores higher than an Event. But a very recent Event can still outrank an old Placement — recency matters.
+
+All notifications are fetched from the live API, scored, and the top N are extracted using a **min-heap** of size N. This keeps the algorithm at O(M log N) where M = total notifications — efficient even as new notifications stream in.
+
+---
+
+## Maintaining Top N as New Notifications Arrive
+
+A min-heap of fixed size N is the optimal structure:
+
+1. Fetch new notification, compute its score
+2. If heap has fewer than N items → push directly
+3. If new score > heap minimum → pop the minimum, push the new one
+4. Otherwise → discard (it would not make the top N)
+
+This means each new notification is processed in O(log N) time — the heap never grows beyond N items.
+
+The implementation code and output screenshots are available in the repository under `notification_app_be/priority.js`.
